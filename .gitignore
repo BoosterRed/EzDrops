@@ -38,3 +38,6 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 배포용 패키지 (GitHub Releases에 첨부, 저장소에는 두지 않는다)
+*.zip
