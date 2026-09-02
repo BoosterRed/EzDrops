@@ -119,6 +119,50 @@ def append_registry(path, salt, new_prints):
         pass
 
 
+MAX_GRID_COLUMNS = 5      # 한 줄에 놓을 창의 최대 개수
+MAX_WINDOW_WIDTH = 1280   # 창 하나의 최대 크기. 화면이 넉넉해도 이보다 크게 키우지는 않는다.
+MAX_WINDOW_HEIGHT = 720
+MIN_WINDOW_WIDTH = 640    # 이보다 좁아지면 사이트가 모바일 레이아웃으로 바뀔 수 있어 하한을 둔다.
+MIN_WINDOW_HEIGHT = 480
+MIN_VISIBLE_X = 200       # 창이 겹치더라도 앞쪽 이만큼은 보이게 한다(어느 창인지 구분용).
+MIN_VISIBLE_Y = 200
+
+
+def compute_window_layout(count, screen_w, screen_h):
+    """창 개수와 화면 크기로 (창 너비, 창 높이, [(x, y), ...])를 계산한다.
+
+    v1.9.20 이전에는 창 크기(1280x720)와 열 수(3)가 상수로 박혀 있어서, 화면이 좁거나 코드가
+    많으면 아래쪽 창이 화면 밖으로 나가 눈으로 확인할 수 없었다(2560x1440에서도 7번째 창부터
+    잘림). 여기서는 반대로 화면에서 출발해 창 크기와 간격을 역산한다.
+
+    보장하는 것: 모든 창이 화면 안에 완전히 들어온다. 창이 겹치더라도 각 창의 앞부분
+    MIN_VISIBLE_X/Y 만큼은 다음 창에 가려지지 않는다.
+
+    순수 함수로 둔 이유는 Tk나 브라우저 없이 여러 해상도를 그대로 검증하기 위함이다.
+    """
+    count = max(1, count)
+    cols = min(count, MAX_GRID_COLUMNS)
+    rows = -(-count // cols)  # 올림 나눗셈
+
+    # 창 크기: 화면에 다 넣으려면 겹침 간격(MIN_VISIBLE)만큼은 자리를 비워둬야 한다.
+    win_w = min(MAX_WINDOW_WIDTH, screen_w - MIN_VISIBLE_X * (cols - 1))
+    win_h = min(MAX_WINDOW_HEIGHT, screen_h - MIN_VISIBLE_Y * (rows - 1))
+    # 화면이 너무 좁아 하한을 지킬 수 없으면, 화면 밖으로 내보내느니 하한을 택한다.
+    win_w = max(MIN_WINDOW_WIDTH, win_w)
+    win_h = max(MIN_WINDOW_HEIGHT, win_h)
+
+    # 남는 공간을 창 사이에 균등 분배한다. 한 줄에 하나뿐이면 나눌 필요가 없다.
+    gap_x = (screen_w - win_w) // (cols - 1) if cols > 1 else 0
+    gap_y = (screen_h - win_h) // (rows - 1) if rows > 1 else 0
+
+    positions = []
+    for i in range(count):
+        col, row = i % cols, i // cols
+        # 하한 때문에 창이 화면보다 클 수 있다. 그 경우 음수 좌표가 되지 않게 0으로 붙인다.
+        positions.append((max(0, col * gap_x), max(0, row * gap_y)))
+    return win_w, win_h, positions
+
+
 def scrub_codes(text, codes):
     """예외 메시지처럼 우리가 만들지 않은 문자열에서 리딤 코드를 찾아 마스킹으로 바꾼다.
 
@@ -177,7 +221,10 @@ from playwright.async_api import async_playwright
 # 1.9.19       코드 전체를 담던 results.csv를 없애고, 되돌릴 수 없는 SHA-256 지문만 쌓는
 #              중복 등록 방지 기록(registered_codes.txt)으로 대체. 시작할 때 입력 코드와
 #              대조해 "이미 등록한 코드"를 알려준다. GUI 체크박스로 끌 수 있다.
-APP_VERSION = "1.9.19"
+# 1.9.20       창 배치를 화면 해상도에서 역산하도록 변경(최대 5열). 이전에는 창 크기 1280x720과
+#              3열이 상수로 박혀 있어 2560x1440에서도 7번째 창부터 화면 밖으로 나갔다. 이제
+#              모든 창이 화면 안에 들어오고, 겹치더라도 앞쪽 200px은 항상 보인다.
+APP_VERSION = "1.9.20"
 
 # 창별 자동 로그인 시도 간격의 기본값(초). v1.9.17부터 GUI에서 바꿀 수 있고, 이 값은
 # 입력이 비었거나 숫자가 아닐 때 되돌아가는 기준점으로만 쓰인다.
@@ -193,6 +240,10 @@ class EzDropsApp:
         self.root.geometry("600x820")
         self.log_file_path = os.path.join(get_base_dir(), "run_log.txt")
         self.registry_path = os.path.join(get_base_dir(), REGISTRY_FILENAME)
+        # 화면 크기는 Tk 메인스레드에서만 안전하게 읽을 수 있어서 시작 시점에 한 번 받아둔다.
+        # 브라우저 배치 계산은 백그라운드 스레드에서 돌기 때문에 거기서 직접 읽으면 안 된다.
+        self.screen_w = root.winfo_screenwidth()
+        self.screen_h = root.winfo_screenheight()
 
         try:
             # iconbitmap(단일 .ico)은 Windows에서 프레임 하나만 가져다 자체적으로(저품질로)
@@ -624,14 +675,6 @@ class EzDropsApp:
         self.live_contexts = contexts  # 앱 종료 시(on_close) 이 리스트를 보고 전부 닫는다
         try:
             async with async_playwright() as p:
-                # 한 줄에 3개까지는 우측으로 1/3씩 이동, 3개를 넘으면 다음 줄(아래)로 내려가되
-                # 이전 줄 창의 하단 1/3 지점부터 겹치도록(=위쪽 2/3만큼 아래로) 이동.
-                VIEWPORT_WIDTH = 1280
-                VIEWPORT_HEIGHT = 720
-                GRID_COLUMNS = 3
-                COL_OFFSET_X = VIEWPORT_WIDTH // 3
-                ROW_OFFSET_Y = VIEWPORT_HEIGHT * 2 // 3
-
                 pages = []
                 # 창마다 닫힘 이벤트를 등록해두면, 나중에 "브라우저가 전부 닫혔는지"를 언제든
                 # ev.is_set()으로 논블로킹 확인할 수 있다 (확인 대기 중 중단 감지, 배치 종료 후
@@ -643,9 +686,18 @@ class EzDropsApp:
                 # 그 차이만큼 추가로 연다.
                 async def ensure_pages(target_count):
                     start_idx = len(pages)
+                    # 창 크기와 좌표를 화면 해상도에서 역산한다(v1.9.20). 이미 열려있는 창은
+                    # 다시 배치하지 않으므로, 새로 여는 창에만 이 좌표를 적용한다.
+                    win_w, win_h, positions = compute_window_layout(
+                        target_count, self.screen_w, self.screen_h
+                    )
+                    if start_idx == 0 and target_count:
+                        self.log(
+                            f"[알림] 화면 {self.screen_w}x{self.screen_h}에 맞춰 창 {target_count}개를 "
+                            f"{win_w}x{win_h} 크기로 배치합니다."
+                        )
                     for i in range(start_idx, target_count):
-                        col = i % GRID_COLUMNS
-                        row = i // GRID_COLUMNS
+                        pos_x, pos_y = positions[i]
                         ctx = await p.chromium.launch_persistent_context(
                             # 프로필들은 기능상 분리되어야 하지만(리디렉션 버그 방지), 실행
                             # 폴더에 여러 개가 흩어져 지저분해 보이지 않도록 상위 폴더 하나로
@@ -655,11 +707,11 @@ class EzDropsApp:
                             # 사용 — exe 용량을 크게 줄임. 대상 PC에 크롬이 설치돼 있어야 함.
                             channel="chrome",
                             headless=False,
-                            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                            viewport={"width": win_w, "height": win_h},
                             args=[
                                 "--disable-blink-features=AutomationControlled",
-                                f"--window-position={col * COL_OFFSET_X},{row * ROW_OFFSET_Y}",
-                                f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}",
+                                f"--window-position={pos_x},{pos_y}",
+                                f"--window-size={win_w},{win_h}",
                             ]
                         )
                         contexts.append(ctx)
